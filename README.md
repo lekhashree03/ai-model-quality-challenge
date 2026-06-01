@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Cerebras Performance Sweep UI
 
 **Live URL:** paste your Vercel deployment link here after deploying.
@@ -69,3 +70,6 @@ If a metric is missing, the UI still renders and marks that field as unavailable
 - Framework choice: React/Vite because the whole workflow can run client-side and deploy easily on Vercel.
 - Assumptions: uploaded `.xlsx` files follow the same general column contract; model/profile can be inferred from filename or workbook metadata.
 - With more data: add production-vs-projection calibration, richer anomaly rules, confidence intervals, and saved comparison sessions.
+=======
+# ai-model-quality-challenge
+>>>>>>> 66adcd75954f17de9bdf4fdd0fe4d1cf3a6e5bd8
