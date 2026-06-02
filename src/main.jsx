@@ -6,7 +6,7 @@ import './styles.css';
 
 const CUSTOMER_TARGETS = { throughput: 250000, ttft: 0.5, rpm: 500 };
 const fmt = (n, digits=0) => n === null || n === undefined || Number.isNaN(Number(n)) ? '—' : Number(n).toLocaleString(undefined,{maximumFractionDigits:digits});
-const sec = n => n === null || n === undefined || Number.isNaN(Number(n)) ? '—' : `${Number(n).toFixed(2)}s`;
+const sec = n => n === null || n === undefined || !Number.isFinite(Number(n)) ? '—' : `${Number(n).toFixed(2)}s`;
 const norm = s => String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
 const get = (row, names) => {
   const map = Object.fromEntries(Object.keys(row).map(k => [norm(k), row[k]]));
@@ -22,52 +22,102 @@ function inferModelProfile(fileName, path='') {
   return { model: `Model ${model}`, modelKey: model, profile: `Profile ${profile}`, profileNum: Number(profile) || 0 };
 }
 
+function rowsFromSheet(sheet, expectedColumns = []) {
+  if (!sheet) return [];
+  const raw = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', blankrows: false });
+  if (!raw.length) return [];
+
+  // Excel sweeps may have one or more blank/metadata rows before the real header.
+  // Find the row that best matches the expected Cerebras Summary/sim columns.
+  let bestIndex = -1;
+  let bestScore = -1;
+  raw.forEach((row, idx) => {
+    const normalizedCells = row.map(norm);
+    const score = expectedColumns.reduce((acc, col) => acc + (normalizedCells.includes(norm(col)) ? 1 : 0), 0);
+    if (score > bestScore) { bestScore = score; bestIndex = idx; }
+  });
+
+  // If no expected header is found, fallback to the first non-empty row.
+  const headerIndex = bestScore > 0 ? bestIndex : raw.findIndex(r => r.some(c => String(c).trim() !== ''));
+  if (headerIndex < 0) return [];
+
+  const headers = raw[headerIndex].map((h, i) => String(h || `Column ${i + 1}`).trim());
+  return raw.slice(headerIndex + 1)
+    .filter(row => row.some(c => c !== '' && c !== null && c !== undefined))
+    .map(row => Object.fromEntries(headers.map((h, i) => [h, row[i] ?? ''])));
+}
+
+function validNumber(v) {
+  const n = num(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 function parseWorkbook(buffer, fileName, path='') {
   const wb = XLSX.read(buffer, {type:'array'});
   const meta = inferModelProfile(fileName, path);
-  const summaryName = wb.SheetNames.find(s => norm(s) === 'summary') || wb.SheetNames[0];
-  const summaryRaw = XLSX.utils.sheet_to_json(wb.Sheets[summaryName], {defval:null, blankrows:false});
-  const summaryRows = summaryRaw.map((r, i) => ({
-    rowId: i + 1,
-    inputLength: num(get(r, ['Input Length','Input Tokens','Context Length'])) ?? null,
-    outputLength: num(get(r, ['Output Length','Output Tokens','Generated Tokens'])) ?? null,
-    cachePct: num(get(r, ['Cache %','Cache'])) ?? null,
-    gMethod: get(r, ['G Method','Method']) || '—',
-    targetPromptG: num(get(r, ['Target Prompt G','Target G','G'])) ?? null,
-    batchSize: num(get(r, ['Batch Size','Batch'])) ?? null,
-    maxS: num(get(r, ['Max S','Maximum S'])) ?? null,
-    targetMaxS: num(get(r, ['Target Max S'])) ?? null,
-    concurrency: num(get(r, ['Concurrency'])) ?? null,
-    promptOnlyThroughput: num(get(r, ['Prompt only Throughput (t/s)','Prompt Throughput'])) ?? null,
-    genOnlyThroughput: num(get(r, ['Gen only Throughput (t/s)','Generation Throughput'])) ?? null,
-    throughput: num(get(r, ['Throughput (t/s)','Throughput Mean','Throughput'])) ?? null,
-    throughputPerBox: num(get(r, ['Throughput / box (t/s/csx)','Throughput per box'])) ?? null,
-    uncachedThroughput: num(get(r, ['Uncached Throughput (t/s)','Uncached Throughput Mean'])) ?? null,
-    cachedThroughput: num(get(r, ['Cached Throughput (t/s)','Cached Throughput Mean'])) ?? null,
-    ttft: num(get(r, ['TTFT (sec)','TTFT Mean','TTFT'])) ?? null,
-    realPromptSpeed: num(get(r, ['Real Prompt Speed (t/s/user)','Real Prompt Speed Mean'])) ?? null,
-    promptQueueSpeed: num(get(r, ['Prompt Speed with Queueing (t/s/user)','Prompt Speed with Queueing Mean'])) ?? null,
-    genSpeed: num(get(r, ['Gen Speed (t/s/user)','Real Gen Speed Mean'])) ?? null,
-    rpm: num(get(r, ['RPM','Requests Per Minute'])) ?? null,
-    raw: r
-  })).filter(r => r.throughput || r.ttft || r.rpm || r.concurrency);
+  const summaryName = wb.SheetNames.find(s => norm(s) === 'summary') || wb.SheetNames.find(s => norm(s).includes('summary')) || wb.SheetNames[0];
+
+  const summaryRaw = rowsFromSheet(wb.Sheets[summaryName], [
+    'Input Length', 'Output Length', 'Cache %', 'G Method', 'Target Prompt G',
+    'Batch Size', 'Max S', 'Target Max S', 'Concurrency', 'Throughput (t/s)',
+    'TTFT (sec)', 'Gen Speed (t/s/user)', 'RPM'
+  ]);
+
+  // Summary rows often inherit Input/Output/Cache values from the first row visually.
+  // Forward-fill those context fields so every configuration has a complete customer summary.
+  let lastInput = null, lastOutput = null, lastCache = null;
+  const summaryRows = summaryRaw.map((r, i) => {
+    const input = validNumber(get(r, ['Input Length','Input Tokens','Context Length']));
+    const output = validNumber(get(r, ['Output Length','Output Tokens','Generated Tokens']));
+    const cache = validNumber(get(r, ['Cache %','Cache']));
+    if (input !== null) lastInput = input;
+    if (output !== null) lastOutput = output;
+    if (cache !== null) lastCache = cache;
+    return {
+      rowId: i + 1,
+      inputLength: input ?? lastInput,
+      outputLength: output ?? lastOutput,
+      cachePct: cache ?? lastCache,
+      gMethod: get(r, ['G Method','Method']) || '—',
+      targetPromptG: validNumber(get(r, ['Target Prompt G','Target G','G'])),
+      batchSize: validNumber(get(r, ['Batch Size','Batch'])),
+      maxS: validNumber(get(r, ['Max S','Maximum S'])),
+      targetMaxS: validNumber(get(r, ['Target Max S'])),
+      concurrency: validNumber(get(r, ['Concurrency'])),
+      promptOnlyThroughput: validNumber(get(r, ['Prompt only Throughput (t/s)','Prompt Throughput'])),
+      genOnlyThroughput: validNumber(get(r, ['Gen only Throughput (t/s)','Generation Throughput'])),
+      throughput: validNumber(get(r, ['Throughput (t/s)','Throughput Mean','Throughput'])),
+      throughputPerBox: validNumber(get(r, ['Throughput / box (t/s/csx)','Throughput per box'])),
+      uncachedThroughput: validNumber(get(r, ['Uncached Throughput (t/s)','Uncached Throughput Mean'])),
+      uncachedThroughputPerBox: validNumber(get(r, ['Uncached Throughput / box (t/s/csx)'])),
+      cachedThroughput: validNumber(get(r, ['Cached Throughput (t/s)','Cached Throughput Mean'])),
+      cachedThroughputPerBox: validNumber(get(r, ['Cached Throughput / box (t/s/csx)'])),
+      ttft: validNumber(get(r, ['TTFT (sec)','TTFT Mean','TTFT'])),
+      realPromptSpeed: validNumber(get(r, ['Real Prompt Speed (t/s/user)','Real Prompt Speed Mean'])),
+      promptQueueSpeed: validNumber(get(r, ['Prompt Speed with Queueing (t/s/user)','Prompt Speed with Queueing Mean'])),
+      genSpeed: validNumber(get(r, ['Gen Speed (t/s/user)','Real Gen Speed Mean'])),
+      rpm: validNumber(get(r, ['RPM','Requests Per Minute'])),
+      raw: r
+    };
+  }).filter(r => r.throughput !== null || r.ttft !== null || r.rpm !== null || r.concurrency !== null);
 
   const scenarioSheets = wb.SheetNames.filter(n => n !== summaryName && /^sim_/i.test(n)).map(name => {
-    const rows = XLSX.utils.sheet_to_json(wb.Sheets[name], {defval:null}).map(r => ({
-      concurrency: num(get(r, ['Concurrency'])),
-      throughputMean: num(get(r, ['Throughput Mean','Throughput (t/s)','Throughput'])),
-      ttftMean: num(get(r, ['TTFT Mean','TTFT (sec)','TTFT'])),
-      genSpeedMean: num(get(r, ['Real Gen Speed Mean','Gen Speed (t/s/user)'])),
+    const rows = rowsFromSheet(wb.Sheets[name], ['Concurrency','Throughput Mean','TTFT Mean','Real Gen Speed Mean']).map(r => ({
+      concurrency: validNumber(get(r, ['Concurrency'])),
+      throughputMean: validNumber(get(r, ['Throughput Mean','Throughput (t/s)','Throughput'])),
+      ttftMean: validNumber(get(r, ['TTFT Mean','TTFT (sec)','TTFT'])),
+      genSpeedMean: validNumber(get(r, ['Real Gen Speed Mean','Gen Speed (t/s/user)'])),
       raw: r
-    })).filter(r => r.concurrency !== null);
+    })).filter(r => r.concurrency !== null || r.throughputMean !== null || r.ttftMean !== null);
     return {name, rows};
   });
 
-  const best = [...summaryRows].sort((a,b)=>(b.throughput||0)-(a.throughput||0))[0] || null;
+  const best = [...summaryRows].filter(r => r.throughput !== null).sort((a,b)=>(b.throughput||0)-(a.throughput||0))[0] || null;
   const lowestTTFT = [...summaryRows].filter(r=>r.ttft!==null).sort((a,b)=>a.ttft-b.ttft)[0] || null;
+  const bestRpm = [...summaryRows].filter(r=>r.rpm!==null).sort((a,b)=>(b.rpm||0)-(a.rpm||0))[0] || null;
   const verdict = !best ? 'No data' : (best.throughput >= CUSTOMER_TARGETS.throughput && (lowestTTFT?.ttft ?? 99) <= CUSTOMER_TARGETS.ttft ? 'Go' : best.throughput >= CUSTOMER_TARGETS.throughput*0.75 ? 'Review' : 'No-Go');
 
-  return { id: `${meta.modelKey}-${meta.profileNum}-${fileName}-${Date.now()}-${Math.random()}`, fileName, path, ...meta, summaryRows, scenarioSheets, best, lowestTTFT, verdict };
+  return { id: `${meta.modelKey}-${meta.profileNum}-${fileName}-${Date.now()}-${Math.random()}`, fileName, path, ...meta, summaryName, summaryRows, scenarioSheets, best, lowestTTFT, bestRpm, verdict };
 }
 
 async function loadDefaultFiles(){
