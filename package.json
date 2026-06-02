@@ -1,14 +1,9 @@
 {
-  "name": "cerebras-perf-ui",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
   "scripts": {
-    "dev": "vite --host 0.0.0.0",
-    "build": "vite build",
-    "preview": "vite preview --host 0.0.0.0",
+    "dev": "vite",
     "build:data": "node scripts/build-data-manifest.js",
-    "prebuild": "npm run build:data"
+    "build": "npm run build:data && vite build",
+    "preview": "vite preview"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
@@ -16,8 +11,8 @@
     "react": "latest",
     "react-dom": "latest",
     "xlsx": "latest",
-    "recharts": "latest",
     "lucide-react": "latest"
   },
-  "devDependencies": {}
+  "devDependencies": {},
+  "type": "module"
 }
