@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import * as XLSX from 'xlsx';
 import {
@@ -44,7 +44,7 @@ function findColumn(headers, aliases) {
 function toNumber(value) {
   if (value === null || value === undefined || value === '') return null;
   if (typeof value === 'number' && Number.isFinite(value)) return value;
-  const cleaned = String(value).replace(/[$,% commas]/g, '').replace(/,/g, '').trim();
+  const cleaned = String(value).replace(/[$%]/g, '').replace(/,/g, '').trim();
   const parsed = Number(cleaned);
   return Number.isFinite(parsed) ? parsed : null;
 }
@@ -73,6 +73,8 @@ async function parseWorkbook(file) {
   return rows.map((row, index) => ({
     id: `${file.name}-${index}`,
     sourceFile: file.name,
+    sourcePath: file.webkitRelativePath || file.relativePath || file.name,
+    sourceType: file.sourceType || 'Uploaded',
     sheetName,
     rowIndex: index + 2,
     model: String(row.model || row.Model || inferred.model),
@@ -152,7 +154,7 @@ function anomalyRows(rows) {
 }
 
 function UploadPanel({ onRows }) {
-  const [status, setStatus] = useState('Upload one or many .xlsx perf sweeps.');
+  const [status, setStatus] = useState('Upload one or many .xlsx perf sweeps, or add more on top of the default sample data.');
 
   async function handleFiles(files) {
     const xlsxFiles = [...files].filter((file) => file.name.toLowerCase().endsWith('.xlsx'));
@@ -163,8 +165,8 @@ function UploadPanel({ onRows }) {
     try {
       const parsed = await Promise.all(xlsxFiles.map(parseWorkbook));
       const rows = parsed.flat();
-      onRows(rows);
-      setStatus(`Parsed ${fmt(rows.length, 0)} rows from ${xlsxFiles.length} workbook(s).`);
+      onRows((previousRows) => [...previousRows, ...rows]);
+      setStatus(`Added ${fmt(rows.length, 0)} rows from ${xlsxFiles.length} uploaded workbook(s).`);
     } catch (err) {
       console.error(err);
       setStatus(`Could not parse upload: ${err.message}`);
@@ -183,6 +185,12 @@ function UploadPanel({ onRows }) {
         <span>Choose `.xlsx` files</span>
         <small>Supports multi-file selection and unseen models like Model L.</small>
         <input type="file" multiple accept=".xlsx" onChange={(e) => handleFiles(e.target.files)} />
+      </label>
+      <label className="dropzone secondary-dropzone">
+        <FileSpreadsheet size={24} />
+        <span>Or choose the whole perf_data folder</span>
+        <small>Useful for Model_A_profile_1, Model_B_profile_4, etc.</small>
+        <input type="file" multiple webkitdirectory="true" directory="true" onChange={(e) => handleFiles(e.target.files)} />
       </label>
       <p className="status"><FileSpreadsheet size={16} /> {status}</p>
     </section>
@@ -267,12 +275,12 @@ function InternalView({ rows, summaries }) {
       <div className="table-card">
         <h3><AlertTriangle size={18} /> Anomaly queue ({anomalies.length})</h3>
         <table>
-          <thead><tr><th>Model</th><th>Profile</th><th>File</th><th>Row</th><th>Tok/s</th><th>TTFT</th><th>Latency</th></tr></thead>
+          <thead><tr><th>Model</th><th>Profile</th><th>Source</th><th>File</th><th>Row</th><th>Tok/s</th><th>TTFT</th><th>Latency</th></tr></thead>
           <tbody>
             {anomalies.slice(0, 50).map((r) => (
-              <tr key={r.id}><td>{r.model}</td><td>{r.profile}</td><td>{r.sourceFile}</td><td>{r.rowIndex}</td><td>{fmt(r.throughput)}</td><td>{fmt(r.ttft)}</td><td>{fmt(r.latency)}</td></tr>
+              <tr key={r.id}><td>{r.model}</td><td>{r.profile}</td><td>{r.sourceType}</td><td>{r.sourcePath}</td><td>{r.rowIndex}</td><td>{fmt(r.throughput)}</td><td>{fmt(r.ttft)}</td><td>{fmt(r.latency)}</td></tr>
             ))}
-            {!anomalies.length && <tr><td colSpan="7">No obvious anomalies detected by the default rules.</td></tr>}
+            {!anomalies.length && <tr><td colSpan="8">No obvious anomalies detected by the default rules.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -307,16 +315,58 @@ function ComparisonView({ summaries }) {
   );
 }
 
+
+async function loadDefaultSweeps() {
+  const manifestResponse = await fetch('/perf_data/manifest.json', { cache: 'no-cache' });
+  if (!manifestResponse.ok) {
+    throw new Error('Default manifest not found. Run npm run build:data after copying perf_data into public/perf_data.');
+  }
+  const manifest = await manifestResponse.json();
+  const files = Array.isArray(manifest.files) ? manifest.files : [];
+  if (!files.length) return [];
+
+  const parsed = await Promise.all(files.map(async (entry) => {
+    const path = typeof entry === 'string' ? entry : entry.path;
+    const response = await fetch(path);
+    if (!response.ok) throw new Error(`Could not load ${path}`);
+    const blob = await response.blob();
+    const name = path.split('/').pop();
+    const file = new File([blob], name, { type: blob.type || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    file.relativePath = path;
+    file.sourceType = 'Default perf_data';
+    return parseWorkbook(file);
+  }));
+  return parsed.flat();
+}
+
 function EmptyState() {
-  return <section className="empty"><h2>Upload perf sweeps to begin</h2><p>The app parses files in the browser. No rebuild, no hard-coded model list, and no backend required for Vercel.</p></section>;
+  return <section className="empty"><h2>No default sweeps loaded yet</h2><p>Copy the extracted perf_data folders into public/perf_data and run npm run build:data. You can also upload .xlsx sweeps manually.</p></section>;
 }
 
 function App() {
   const [rows, setRows] = useState([]);
+  const [defaultStatus, setDefaultStatus] = useState('Loading default perf_data sweeps...');
   const summaries = useMemo(() => summarize(rows), [rows]);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadDefaultSweeps()
+      .then((defaultRows) => {
+        if (cancelled) return;
+        setRows(defaultRows);
+        setDefaultStatus(defaultRows.length ? `Loaded ${fmt(defaultRows.length, 0)} rows from default perf_data.` : 'Default manifest exists but has no .xlsx files.');
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.warn(err);
+        setDefaultStatus('Default perf_data not loaded. Upload files manually, or add public/perf_data and run npm run build:data.');
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   return (
     <main>
+      <div className="default-status">{defaultStatus}</div>
       <UploadPanel onRows={setRows} />
       {rows.length ? <><ComparisonView summaries={summaries} /><CustomerView summaries={summaries} /><InternalView rows={rows} summaries={summaries} /></> : <EmptyState />}
     </main>

@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
-    "preview": "vite preview --host 0.0.0.0"
+    "preview": "vite preview --host 0.0.0.0",
+    "build:data": "node scripts/build-data-manifest.js",
+    "prebuild": "npm run build:data"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
